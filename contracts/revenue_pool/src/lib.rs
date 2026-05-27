@@ -31,6 +31,16 @@ pub const DEFAULT_MAX_DISTRIBUTE: i128 = i128::MAX;
 /// the vault's `MAX_BATCH_SIZE` for `batch_deduct`.
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// TTL bump constants for instance storage archival risk mitigation.
+/// Soroban archives ledger entries after ~7 days (631 ledgers) of inactivity.
+/// Bumping TTL ensures state remains accessible for critical operations.
+/// 
+/// # Constants
+/// - `BUMP_AMOUNT`: Number of ledgers to extend TTL by (10000 ledgers ≈ 16 days)
+/// - `LIFETIME_THRESHOLD`: Minimum TTL before triggering a bump (1000 ledgers ≈ 1.5 days)
+pub const BUMP_AMOUNT: u32 = 10000;
+pub const LIFETIME_THRESHOLD: u32 = 1000;
+
 #[contract]
 pub struct RevenuePool;
 
@@ -62,6 +72,9 @@ impl RevenuePool {
         }
         inst.set(&Symbol::new(&env, ADMIN_KEY), &admin);
         inst.set(&Symbol::new(&env, USDC_KEY), &usdc_token);
+
+        // Extend TTL on initialization to prevent archival
+        inst.extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
 
         env.events()
             .publish((Symbol::new(&env, "init"), admin), usdc_token);
@@ -124,6 +137,7 @@ impl RevenuePool {
         }
         let inst = env.storage().instance();
         inst.set(&Symbol::new(&env, PENDING_ADMIN_KEY), &new_admin);
+        inst.extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
 
         // Emit explicit before/after admin intent for indexers and audit trails.
         env.events().publish(
@@ -162,6 +176,7 @@ impl RevenuePool {
 
         inst.set(&Symbol::new(&env, ADMIN_KEY), &pending);
         inst.remove(&Symbol::new(&env, PENDING_ADMIN_KEY));
+        inst.extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
 
         env.events()
             .publish((Symbol::new(&env, "admin_transfer_completed"), pending), ());
@@ -293,6 +308,8 @@ impl RevenuePool {
             panic!("{}", ERR_INSUFFICIENT_BALANCE);
         }
 
+        env.storage().instance().extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
+
         usdc.transfer(&contract_address, &to, &amount);
         env.events()
             .publish((Symbol::new(&env, "distribute"), to), amount);
@@ -390,6 +407,9 @@ impl RevenuePool {
         if usdc.balance(&contract_address) < total_amount {
             panic!("{}", ERR_INSUFFICIENT_BALANCE);
         }
+
+        // Extend TTL before executing transfers
+        env.storage().instance().extend_ttl(LIFETIME_THRESHOLD, BUMP_AMOUNT);
 
         // Phase 3: Execution
         // All validation passed - now perform the transfers
