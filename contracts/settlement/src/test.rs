@@ -66,6 +66,44 @@ mod settlement_tests {
         assert_eq!(all_balances.len(), 0);
         assert_eq!(client.get_developer_balance(&developer), 0);
     }
+    #[test]
+    #[should_panic(expected = "invalid config: admin and vault_address must be distinct")]
+    fn test_init_admin_equals_vault_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+
+        // Passing the same address for admin and vault should be rejected.
+        client.init(&admin, &admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid config: admin cannot be the contract itself")]
+    fn test_init_admin_is_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+
+        // Passing the contract's own address as admin should be rejected.
+        client.init(&addr, &vault);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid config: vault_address cannot be the contract itself")]
+    fn test_init_vault_is_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+
+        // Passing the contract's own address as vault_address should be rejected.
+        client.init(&admin, &addr);
+    }
 
     #[test]
     fn test_init_requires_admin_signature() {
@@ -345,6 +383,41 @@ mod settlement_tests {
 
         client.set_vault(&admin, &new_vault);
         assert_eq!(client.get_vault(), new_vault);
+    }
+
+    #[test]
+    fn test_set_vault_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{IntoVal, Symbol};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let new_vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+
+        client.set_vault(&admin, &new_vault);
+
+        let events = env.events().all();
+        let ev = events
+            .iter()
+            .find(|e| {
+                !e.1.is_empty() && {
+                    let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                    t == Symbol::new(&env, "vault_changed")
+                }
+            })
+            .expect("expected vault_changed event");
+
+        let topic1: Address = ev.1.get(1).unwrap().into_val(&env);
+        assert_eq!(topic1, admin);
+
+        let data: crate::VaultChangedEvent = ev.2.into_val(&env);
+        assert_eq!(data.old_vault, vault);
+        assert_eq!(data.new_vault, new_vault);
     }
 
     // â”€â”€ admin rotation edge cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
