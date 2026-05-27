@@ -3272,3 +3272,245 @@ fn get_contract_addresses_updates_after_clear_revenue_pool() {
     let (_, _, got_pool) = client.get_contract_addresses();
     assert_eq!(got_pool, None);
 }
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Issue #346 — batch_deduct event-ordering and partial-failure regression tests
+// ---------------------------------------------------------------------------
+
+/// Assert that deduct events fire in the same order as the input items.
+///
+/// batch_deduct must emit one `deduct` event per item, and the sequence of
+/// those events must match the input Vec order (index 0 first, last item last).
+#[test]
+fn batch_deduct_events_fire_in_input_order() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1_000);
+    client.init(&owner, &usdc, &Some(1_000), &None, &None, &None, &None);
+
+    let rid0 = Symbol::new(&env, "order_0");
+    let rid1 = Symbol::new(&env, "order_1");
+    let rid2 = Symbol::new(&env, "order_2");
+
+    let items = soroban_sdk::vec![
+        &env,
+        DeductItem { amount: 100, request_id: Some(rid0.clone()) },
+        DeductItem { amount: 200, request_id: Some(rid1.clone()) },
+        DeductItem { amount: 300, request_id: Some(rid2.clone()) },
+    ];
+
+    client.batch_deduct(&caller, &items);
+
+    let all = env.events().all();
+    let deduct_sym = Symbol::new(&env, "deduct");
+
+    // Collect into a std Vec — soroban_sdk::Vec does not implement FromIterator.
+    let deduct_events: std::vec::Vec<_> = all
+        .iter()
+        .filter(|e| {
+            e.0 == vault_address
+                && e.1.len() >= 3
+                && {
+                    let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                    t == deduct_sym
+                }
+        })
+        .collect();
+
+    assert_eq!(deduct_events.len(), 3, "expected 3 deduct events");
+
+    let expected_rids = [rid0, rid1, rid2];
+    for (i, ev) in deduct_events.iter().enumerate() {
+        let rid: Symbol = ev.1.get(2).unwrap().into_val(&env);
+        assert_eq!(
+            rid, expected_rids[i],
+            "event[{i}] request_id does not match input order"
+        );
+    }
+}
+
+/// Assert that every deduct event emitted by batch_deduct carries the correct
+/// running balance in its data payload.
+///
+/// Documented behaviour: each event's balance field reflects the vault balance
+/// *after* that specific item is deducted, computed as a running subtraction
+/// across the batch in input order.
+#[test]
+fn batch_deduct_events_carry_correct_running_balance() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1_000);
+    client.init(&owner, &usdc, &Some(1_000), &None, &None, &None, &None);
+
+    // Amounts: 100, 250, 150  →  running balances after each: 900, 650, 500
+    let items = soroban_sdk::vec![
+        &env,
+        DeductItem { amount: 100, request_id: Some(Symbol::new(&env, "r0")) },
+        DeductItem { amount: 250, request_id: Some(Symbol::new(&env, "r1")) },
+        DeductItem { amount: 150, request_id: Some(Symbol::new(&env, "r2")) },
+    ];
+
+    client.batch_deduct(&caller, &items);
+
+    let all = env.events().all();
+    let deduct_sym = Symbol::new(&env, "deduct");
+
+    let deduct_events: std::vec::Vec<_> = all
+        .iter()
+        .filter(|e| {
+            e.0 == vault_address
+                && e.1.len() >= 3
+                && {
+                    let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                    t == deduct_sym
+                }
+        })
+        .collect();
+
+    assert_eq!(deduct_events.len(), 3, "expected 3 deduct events");
+
+    // Expected (amount, running_balance) pairs in input order.
+    let expected: [(i128, i128); 3] = [(100, 900), (250, 650), (150, 500)];
+
+    for (i, ev) in deduct_events.iter().enumerate() {
+        let (amt, bal): (i128, i128) = ev.2.into_val(&env);
+        assert_eq!(amt, expected[i].0, "event[{i}] amount mismatch");
+        assert_eq!(
+            bal, expected[i].1,
+            "event[{i}] running balance mismatch: expected {} got {}",
+            expected[i].1, bal
+        );
+    }
+}
+
+/// A max_deduct violation on the FIRST item (index 0) must revert the entire
+/// batch — no deduct events emitted, balance unchanged.
+#[test]
+fn batch_deduct_max_deduct_violation_at_index_0_reverts_all() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1_000);
+    // max_deduct = 50; item 0 sends 100 — violates immediately.
+    client.init(&owner, &usdc, &Some(1_000), &None, &None, &None, &Some(50));
+
+    let before = client.balance();
+
+    let items = soroban_sdk::vec![
+        &env,
+        DeductItem { amount: 100, request_id: Some(Symbol::new(&env, "bad0")) }, // violates
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok1"))  },
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok2"))  },
+    ];
+
+    let result = client.try_batch_deduct(&caller, &items);
+    assert!(result.is_err(), "expected batch to be rejected");
+    assert_eq!(client.balance(), before, "balance must not change on revert");
+
+    let deduct_sym = Symbol::new(&env, "deduct");
+    let deduct_count = env.events().all().iter().filter(|e| {
+        e.0 == vault_address
+            && e.1.len() >= 1
+            && {
+                let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                t == deduct_sym
+            }
+    }).count();
+    assert_eq!(deduct_count, 0, "no deduct events must be emitted on full revert");
+}
+
+/// A max_deduct violation on a MIDDLE item must revert the entire batch —
+/// no deduct events emitted, balance unchanged.
+#[test]
+fn batch_deduct_max_deduct_violation_at_middle_index_reverts_all() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1_000);
+    // max_deduct = 50; item at index 1 sends 75 — violates.
+    client.init(&owner, &usdc, &Some(1_000), &None, &None, &None, &Some(50));
+
+    let before = client.balance();
+
+    let items = soroban_sdk::vec![
+        &env,
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok0"))  },
+        DeductItem { amount: 75,  request_id: Some(Symbol::new(&env, "bad1")) }, // violates
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok2"))  },
+    ];
+
+    let result = client.try_batch_deduct(&caller, &items);
+    assert!(result.is_err(), "expected batch to be rejected");
+    assert_eq!(client.balance(), before, "balance must not change on revert");
+
+    let deduct_sym = Symbol::new(&env, "deduct");
+    let deduct_count = env.events().all().iter().filter(|e| {
+        e.0 == vault_address
+            && e.1.len() >= 1
+            && {
+                let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                t == deduct_sym
+            }
+    }).count();
+    assert_eq!(deduct_count, 0, "no deduct events must be emitted on full revert");
+}
+
+/// A max_deduct violation on the LAST item must revert the entire batch —
+/// no deduct events emitted, balance unchanged.
+#[test]
+fn batch_deduct_max_deduct_violation_at_last_index_reverts_all() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1_000);
+    // max_deduct = 50; last item sends 99 — violates.
+    client.init(&owner, &usdc, &Some(1_000), &None, &None, &None, &Some(50));
+
+    let before = client.balance();
+
+    let items = soroban_sdk::vec![
+        &env,
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok0"))  },
+        DeductItem { amount: 10,  request_id: Some(Symbol::new(&env, "ok1"))  },
+        DeductItem { amount: 99,  request_id: Some(Symbol::new(&env, "bad2")) }, // violates
+    ];
+
+    let result = client.try_batch_deduct(&caller, &items);
+    assert!(result.is_err(), "expected batch to be rejected");
+    assert_eq!(client.balance(), before, "balance must not change on revert");
+
+    let deduct_sym = Symbol::new(&env, "deduct");
+    let deduct_count = env.events().all().iter().filter(|e| {
+        e.0 == vault_address
+            && e.1.len() >= 1
+            && {
+                let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                t == deduct_sym
+            }
+    }).count();
+    assert_eq!(deduct_count, 0, "no deduct events must be emitted on full revert");
+}
