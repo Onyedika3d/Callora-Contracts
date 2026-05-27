@@ -44,9 +44,13 @@ pub struct BalanceCreditedEvent {
     pub new_balance: i128,
 }
 
-/// Maximum number of items allowed in a single `batch_receive_payment` call.
-/// Aligns with the 50 used by `batch_deduct` in the vault and `batch_distribute` in the revenue pool.
-pub const MAX_BATCH_SIZE: u32 = 50;
+/// Emitted when the registered vault address is changed via `set_vault()`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultChangedEvent {
+    pub old_vault: Address,
+    pub new_vault: Address,
+}
 
 /// Storage key for the registered vault address.
 const VAULT_KEY: &str = "vault";
@@ -75,10 +79,23 @@ impl CalloraSettlement {
     ///
     /// # Panics
     /// Panics if the contract is already initialized.
+    /// Panics if admin and vault_address are the same.
+    /// Panics if admin is the contract's own address.
+    /// Panics if vault_address is the contract's own address.
     pub fn init(env: Env, admin: Address, vault_address: Address) {
+        admin.require_auth();
         let inst = env.storage().instance();
         if inst.has(&Symbol::new(&env, ADMIN_KEY)) {
             panic!("settlement contract already initialized");
+        }
+        if admin == vault_address {
+            panic!("invalid config: admin and vault_address must be distinct");
+        }
+        if admin == env.current_contract_address() {
+            panic!("invalid config: admin cannot be the contract itself");
+        }
+        if vault_address == env.current_contract_address() {
+            panic!("invalid config: vault_address cannot be the contract itself");
         }
         inst.set(&Symbol::new(&env, ADMIN_KEY), &admin);
         inst.set(&Symbol::new(&env, VAULT_KEY), &vault_address);
@@ -431,8 +448,7 @@ impl CalloraSettlement {
     /// old vault, so coordinate carefully during migrations.
     ///
     /// # Events
-    /// This function does not emit events. Monitor vault changes by
-    /// comparing the result of `get_vault()` across blocks.
+    /// Emits `vault_changed` event with the old and new vault addresses.
     ///
     /// # Panics
     /// Panics if caller is not the current admin.
@@ -442,9 +458,17 @@ impl CalloraSettlement {
         if caller != current_admin {
             panic!("unauthorized: caller is not admin");
         }
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, VAULT_KEY), &new_vault);
+        let inst = env.storage().instance();
+        let old_vault = Self::get_vault(env.clone());
+        inst.set(&Symbol::new(&env, VAULT_KEY), &new_vault);
+
+        env.events().publish(
+            (Symbol::new(&env, "vault_changed"), caller.clone()),
+            VaultChangedEvent {
+                old_vault: old_vault.clone(),
+                new_vault: new_vault.clone(),
+            },
+        );
     }
 
     /// Internal function to require authorized caller (vault or admin)
